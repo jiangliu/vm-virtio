@@ -454,8 +454,11 @@ pub struct Queue {
     /// The maximal size in elements offered by the device
     max_size: u16,
 
-    next_avail: Wrapping<u16>,
-    next_used: Wrapping<u16>,
+    /// The next available index
+    pub next_avail: Wrapping<u16>,
+
+    /// The next used index
+    pub next_used: Wrapping<u16>,
 
     /// Notification from driver is enabled.
     event_notification_enabled: bool,
