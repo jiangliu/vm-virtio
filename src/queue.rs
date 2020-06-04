@@ -155,13 +155,12 @@ impl<'a, M: GuestMemory> DescriptorChain<'a, M> {
             return None;
         }
 
-        let desc_size = size_of::<Descriptor>();
-        let desc_addr = match desc_table.checked_add(desc_size as u64 * index as u64) {
+        let desc_addr = match desc_table.checked_add(VIRTQ_DESCRIPTOR_SIZE as u64 * index as u64) {
             Some(a) => a,
             None => return None,
         };
         // The descriptor is 16 bytes and aligned on on 16-bytes, so it won't cross guest memory boundary.
-        let slice = mem.get_slice(desc_addr, desc_size).ok()?;
+        let slice = mem.get_slice(desc_addr, VIRTQ_DESCRIPTOR_SIZE).ok()?;
         let desc = slice.get_ref(0).ok()?.load();
         let chain = DescriptorChain {
             mem,
@@ -212,7 +211,7 @@ impl<'a, M: GuestMemory> DescriptorChain<'a, M> {
         // These reads can't fail unless Guest memory is hopelessly broken.
         let desc: Descriptor = self
             .mem
-            .get_slice(GuestAddress(desc_head), size_of::<Descriptor>())
+            .get_slice(GuestAddress(desc_head), VIRTQ_DESCRIPTOR_SIZE)
             .map(|s| s.get_ref(0).unwrap().load())
             .map_err(|_| Error::GuestMemoryError)?;
 
@@ -414,7 +413,8 @@ impl<'a, 'b, M: GuestMemory> Iterator for AvailIter<'a, 'b, M> {
     type Item = DescriptorChain<'a, M>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.next_index == self.last_index {
+        let next_index = self.next_index.0 % self.queue_size;
+        if next_index == self.last_index.0 % self.queue_size {
             return None;
         }
 
@@ -441,6 +441,8 @@ impl<'a, 'b, M: GuestMemory> Iterator for AvailIter<'a, 'b, M> {
             DescriptorChain::checked_new(self.mem, self.desc_table, self.queue_size, desc_index);
         if desc.is_some() {
             *self.next_avail += Wrapping(1);
+        } else {
+            error!("Received invalid descriptor, no way to recover!");
         }
         desc
     }
@@ -526,7 +528,7 @@ impl Queue {
     pub fn is_valid<M: GuestMemory>(&self, mem: &M) -> bool {
         let queue_size = self.actual_size() as usize;
         let desc_table = self.desc_table;
-        let desc_table_size = size_of::<Descriptor>() * queue_size;
+        let desc_table_size = VIRTQ_DESCRIPTOR_SIZE * queue_size;
         let avail_ring = self.avail_ring;
         let avail_ring_size = VIRTQ_AVAIL_RING_META_SIZE + VIRTQ_AVAIL_ELEMENT_SIZE * queue_size;
         let used_ring = self.used_ring;
@@ -623,7 +625,9 @@ impl Queue {
 
         let used_ring = self.used_ring;
         let next_used = u64::from(self.next_used.0 % self.actual_size());
-        let used_elem = used_ring.unchecked_add(4 + next_used * 8);
+        let used_elem = used_ring.unchecked_add(
+            VIRTQ_USED_RING_HEADER_SIZE as u64 + next_used * VIRTQ_USED_ELEMENT_SIZE as u64,
+        );
 
         // These writes can't fail as we are guaranteed to be within the descriptor ring.
         vq_store_u32(mem.deref(), u32::from(desc_index), used_elem)
@@ -1448,11 +1452,15 @@ pub(crate) mod tests {
         assert_eq!(vq.used.idx().load(), 0);
 
         //should be ok
-        assert_eq!(q.add_used(m, 1, 0x1000).unwrap(), 1);
-        assert_eq!(vq.used.idx().load(), 1);
+        assert_eq!(q.add_used(m, 10, 0x1000).unwrap(), 1);
+        assert_eq!(q.add_used(m, 11, 0x2000).unwrap(), 2);
+        assert_eq!(vq.used.idx().load(), 2);
         let x = vq.used.ring(0).load();
-        assert_eq!(x.id, 1);
+        assert_eq!(x.id, 10);
         assert_eq!(x.len, 0x1000);
+        let x = vq.used.ring(1).load();
+        assert_eq!(x.id, 11);
+        assert_eq!(x.len, 0x2000);
     }
 
     #[test]
