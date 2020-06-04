@@ -17,9 +17,7 @@ use std::num::Wrapping;
 use std::ops::Deref;
 use std::sync::atomic::{fence, AtomicU16, AtomicU32, Ordering};
 
-use vm_memory::{
-    Address, ByteValued, GuestAddress, GuestAddressSpace, GuestMemory, GuestUsize, VolatileMemory,
-};
+use vm_memory::{Address, ByteValued, GuestAddress, GuestMemory, GuestUsize, VolatileMemory};
 
 pub(super) const VIRTQ_DESC_F_NEXT: u16 = 0x1;
 pub(super) const VIRTQ_DESC_F_WRITE: u16 = 0x2;
@@ -131,8 +129,8 @@ impl Descriptor {
 unsafe impl ByteValued for Descriptor {}
 
 /// A virtio descriptor chain.
-pub struct DescriptorChain<M: GuestAddressSpace> {
-    mem: M::T,
+pub struct DescriptorChain<'a, M: GuestMemory> {
+    mem: &'a M,
     desc_table: GuestAddress,
     queue_size: u16,
     ttl: u16,   // used to prevent infinite chain cycles
@@ -140,14 +138,14 @@ pub struct DescriptorChain<M: GuestAddressSpace> {
 
     /// The current descriptor
     desc: Descriptor,
-    curr_indirect: Option<Box<DescriptorChain<M>>>,
+    curr_indirect: Option<Box<DescriptorChain<'a, M>>>,
     is_master: bool,
     has_next: bool,
 }
 
-impl<M: GuestAddressSpace> DescriptorChain<M> {
+impl<'a, M: GuestMemory> DescriptorChain<'a, M> {
     fn read_new(
-        mem: M::T,
+        mem: &'a M,
         desc_table: GuestAddress,
         queue_size: u16,
         ttl: u16,
@@ -186,7 +184,7 @@ impl<M: GuestAddressSpace> DescriptorChain<M> {
 
     /// Create a new DescriptorChain instance.
     fn checked_new(
-        mem: M::T,
+        mem: &'a M,
         dtable_addr: GuestAddress,
         queue_size: u16,
         index: u16,
@@ -195,7 +193,7 @@ impl<M: GuestAddressSpace> DescriptorChain<M> {
     }
 
     /// Create a `DescriptorChain` from the indirect target descriptor table.
-    pub fn new_from_indirect(&self) -> Result<DescriptorChain<M>, Error> {
+    pub fn new_from_indirect(&self) -> Result<DescriptorChain<'a, M>, Error> {
         if !self.is_indirect() {
             return Err(Error::InvalidIndirectDescriptor);
         }
@@ -219,7 +217,7 @@ impl<M: GuestAddressSpace> DescriptorChain<M> {
             .map_err(|_| Error::GuestMemoryError)?;
 
         let chain = DescriptorChain {
-            mem: self.mem.clone(),
+            mem: self.mem,
             desc_table: GuestAddress(desc_head),
             queue_size: (desc_len / VIRTQ_DESCRIPTOR_SIZE) as u16,
             ttl: (desc_len / VIRTQ_DESCRIPTOR_SIZE) as u16,
@@ -266,12 +264,12 @@ impl<M: GuestAddressSpace> DescriptorChain<M> {
 
     /// Return a `GuestMemory` object that can be used to access the buffers
     /// pointed to by the descriptor chain.
-    pub fn memory(&self) -> &M::M {
+    pub fn memory(&self) -> &M {
         &*self.mem
     }
 
     /// Returns an iterator that only yields the readable descriptors in the chain.
-    pub fn readable(self) -> DescriptorChainRwIter<M> {
+    pub fn readable(self) -> DescriptorChainRwIter<'a, M> {
         DescriptorChainRwIter {
             chain: self,
             writable: false,
@@ -279,7 +277,7 @@ impl<M: GuestAddressSpace> DescriptorChain<M> {
     }
 
     /// Returns an iterator that only yields the writable descriptors in the chain.
-    pub fn writable(self) -> DescriptorChainRwIter<M> {
+    pub fn writable(self) -> DescriptorChainRwIter<'a, M> {
         DescriptorChainRwIter {
             chain: self,
             writable: true,
@@ -287,7 +285,7 @@ impl<M: GuestAddressSpace> DescriptorChain<M> {
     }
 }
 
-impl<M: GuestAddressSpace> Iterator for DescriptorChain<M> {
+impl<'a, M: GuestMemory> Iterator for DescriptorChain<'a, M> {
     type Item = Descriptor;
 
     /// Returns the next descriptor in this descriptor chain, if there is one.
@@ -359,12 +357,12 @@ impl<M: GuestAddressSpace> Iterator for DescriptorChain<M> {
 }
 
 /// An iterator for readable or writable descriptors.
-pub struct DescriptorChainRwIter<M: GuestAddressSpace> {
-    chain: DescriptorChain<M>,
+pub struct DescriptorChainRwIter<'a, M: GuestMemory> {
+    chain: DescriptorChain<'a, M>,
     writable: bool,
 }
 
-impl<M: GuestAddressSpace> Iterator for DescriptorChainRwIter<M> {
+impl<'a, M: GuestMemory> Iterator for DescriptorChainRwIter<'a, M> {
     type Item = Descriptor;
 
     /// Returns the next descriptor in this descriptor chain, if there is one.
@@ -387,8 +385,8 @@ impl<M: GuestAddressSpace> Iterator for DescriptorChainRwIter<M> {
 }
 
 /// Consuming iterator over all available descriptor chain heads in the queue.
-pub struct AvailIter<'b, M: GuestAddressSpace> {
-    mem: M::T,
+pub struct AvailIter<'a, 'b, M: GuestMemory> {
+    mem: &'a M,
     desc_table: GuestAddress,
     avail_ring: GuestAddress,
     next_index: Wrapping<u16>,
@@ -397,9 +395,9 @@ pub struct AvailIter<'b, M: GuestAddressSpace> {
     next_avail: &'b mut Wrapping<u16>,
 }
 
-impl<'b, M: GuestAddressSpace> AvailIter<'b, M> {
+impl<'a, 'b, M: GuestMemory> AvailIter<'a, 'b, M> {
     /// Constructs an empty descriptor iterator.
-    pub fn new(mem: M::T, q_next_avail: &'b mut Wrapping<u16>) -> AvailIter<'b, M> {
+    pub fn new(mem: &'a M, q_next_avail: &'b mut Wrapping<u16>) -> AvailIter<'a, 'b, M> {
         AvailIter {
             mem,
             desc_table: GuestAddress(0),
@@ -412,8 +410,8 @@ impl<'b, M: GuestAddressSpace> AvailIter<'b, M> {
     }
 }
 
-impl<'b, M: GuestAddressSpace> Iterator for AvailIter<'b, M> {
-    type Item = DescriptorChain<M>;
+impl<'a, 'b, M: GuestMemory> Iterator for AvailIter<'a, 'b, M> {
+    type Item = DescriptorChain<'a, M>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.next_index == self.last_index {
@@ -439,12 +437,8 @@ impl<'b, M: GuestAddressSpace> Iterator for AvailIter<'b, M> {
 
         self.next_index += Wrapping(1);
 
-        let desc = DescriptorChain::checked_new(
-            self.mem.clone(),
-            self.desc_table,
-            self.queue_size,
-            desc_index,
-        );
+        let desc =
+            DescriptorChain::checked_new(self.mem, self.desc_table, self.queue_size, desc_index);
         if desc.is_some() {
             *self.next_avail += Wrapping(1);
         }
@@ -454,9 +448,7 @@ impl<'b, M: GuestAddressSpace> Iterator for AvailIter<'b, M> {
 
 #[derive(Clone)]
 /// A virtio queue's parameters.
-pub struct Queue<M: GuestAddressSpace> {
-    mem: M,
-
+pub struct Queue {
     /// The maximal size in elements offered by the device
     max_size: u16,
 
@@ -488,11 +480,10 @@ pub struct Queue<M: GuestAddressSpace> {
     pub used_ring: GuestAddress,
 }
 
-impl<M: GuestAddressSpace> Queue<M> {
+impl Queue {
     /// Constructs an empty virtio queue with the given `max_size`.
-    pub fn new(mem: M, max_size: u16) -> Queue<M> {
+    pub fn new(max_size: u16) -> Queue {
         Queue {
-            mem,
             max_size,
             size: max_size,
             ready: false,
@@ -532,8 +523,7 @@ impl<M: GuestAddressSpace> Queue<M> {
     }
 
     /// Check if the virtio queue configuration is valid.
-    pub fn is_valid(&self) -> bool {
-        let mem = self.mem.memory();
+    pub fn is_valid<M: GuestMemory>(&self, mem: &M) -> bool {
         let queue_size = self.actual_size() as usize;
         let desc_table = self.desc_table;
         let desc_table_size = size_of::<Descriptor>() * queue_size;
@@ -593,11 +583,10 @@ impl<M: GuestAddressSpace> Queue<M> {
     }
 
     /// A consuming iterator over all available descriptor chain heads offered by the driver.
-    pub fn iter(&mut self) -> AvailIter<'_, M> {
+    pub fn iter<'a, 'b, M: GuestMemory>(&'b mut self, mem: &'a M) -> AvailIter<'a, 'b, M> {
         let queue_size = self.actual_size();
         let avail_ring = self.avail_ring;
 
-        let mem = self.mem.memory();
         let index_addr = match avail_ring.checked_add(2) {
             Some(ret) => ret,
             None => {
@@ -623,7 +612,7 @@ impl<M: GuestAddressSpace> Queue<M> {
     }
 
     /// Puts an available descriptor head into the used ring for use by the guest.
-    pub fn add_used(&mut self, desc_index: u16, len: u32) -> Option<u16> {
+    pub fn add_used<M: GuestMemory>(&mut self, mem: &M, desc_index: u16, len: u32) -> Option<u16> {
         if desc_index >= self.actual_size() {
             error!(
                 "attempted to add out of bounds descriptor to used ring: {}",
@@ -632,7 +621,6 @@ impl<M: GuestAddressSpace> Queue<M> {
             return None;
         }
 
-        let mem = self.mem.memory();
         let used_ring = self.used_ring;
         let next_used = u64::from(self.next_used.0 % self.actual_size());
         let used_elem = used_ring.unchecked_add(4 + next_used * 8);
@@ -664,12 +652,11 @@ impl<M: GuestAddressSpace> Queue<M> {
     /// The device MAY use avail_event to advise the driver that notifications are unnecessary until
     /// the driver writes entry with an index specified by avail_event into the available ring
     /// (equivalently, until idx in the available ring will reach the value avail_event + 1).
-    fn update_avail_event(&mut self) {
+    fn update_avail_event<M: GuestMemory>(&mut self, mem: &M) {
         // Safe because we have validated the queue and access guest memory through GuestMemory
         // interfaces.
         // And the `used_index` is a two-byte naturally aligned field, so it won't cross the region
         // boundary and get_slice() shouldn't fail.
-        let mem = self.mem.memory();
         let index_addr = self.avail_ring.unchecked_add(2);
         match vq_load_u16(mem.deref(), index_addr) {
             Ok(index) => {
@@ -683,12 +670,11 @@ impl<M: GuestAddressSpace> Queue<M> {
         }
     }
 
-    fn update_used_flag(&mut self, set: u16, clr: u16) {
+    fn update_used_flag<M: GuestMemory>(&mut self, mem: &M, set: u16, clr: u16) {
         // Safe because we have validated the queue and access guest memory through GuestMemory
         // interfaces.
         // And the `used_index` is a two-byte naturally aligned field, so it won't cross the region
         // boundary and get_slice() shouldn't fail.
-        let mem = self.mem.memory();
         let slice = mem
             .get_slice(self.used_ring, size_of::<u16>())
             .expect("invalid address for virtq_used.flags");
@@ -698,33 +684,33 @@ impl<M: GuestAddressSpace> Queue<M> {
         flag.store((v & !clr) | set, Ordering::Relaxed);
     }
 
-    fn set_notification(&mut self, enable: bool) {
+    fn set_notification<M: GuestMemory>(&mut self, mem: &M, enable: bool) {
         self.event_notification_enabled = enable;
         if self.event_notification_enabled {
             if self.event_idx_enabled {
-                self.update_avail_event();
+                self.update_avail_event(mem);
             } else {
-                self.update_used_flag(0, VIRTQ_USED_F_NO_NOTIFY);
+                self.update_used_flag(mem, 0, VIRTQ_USED_F_NO_NOTIFY);
             }
 
             // This fence ensures that we observe the latest of virtq_avail once we publish
             // virtq_used.avail_event/virtq_used.flags.
             fence(Ordering::AcqRel);
         } else if !self.event_idx_enabled {
-            self.update_used_flag(VIRTQ_USED_F_NO_NOTIFY, 0);
+            self.update_used_flag(mem, VIRTQ_USED_F_NO_NOTIFY, 0);
         }
     }
 
     /// Enable notification events from the guest driver.
     #[inline]
-    pub fn enable_notification(&mut self) {
-        self.set_notification(true);
+    pub fn enable_notification<M: GuestMemory>(&mut self, mem: &M) {
+        self.set_notification(mem, true);
     }
 
     /// Disable notification events from the guest driver.
     #[inline]
-    pub fn disable_notification(&mut self) {
-        self.set_notification(false);
+    pub fn disable_notification<M: GuestMemory>(&mut self, mem: &M) {
+        self.set_notification(mem, false);
     }
 
     /// Return the value present in the used_event field of the avail ring.
@@ -737,12 +723,11 @@ impl<M: GuestAddressSpace> Queue<M> {
     /// Neither of these interrupt suppression methods are reliable, as they are not synchronized
     /// with the device, but they serve as useful optimizations. So we only ensure access to the
     /// virtq_avail.used_event is atomic, but do not need to synchronize with other memory accesses.
-    fn get_used_event(&self) -> Option<Wrapping<u16>> {
+    fn get_used_event<M: GuestMemory>(&self, mem: &M) -> Option<Wrapping<u16>> {
         // Safe because we have validated the queue and access guest memory through GuestMemory
         // interfaces.
         // And the `used_index` is a two-byte naturally aligned field, so it won't cross the region
         // boundary and get_slice() shouldn't fail.
-        let mem = self.mem.memory();
         let used_event_addr = self
             .avail_ring
             .unchecked_add((4 + self.actual_size() * 2) as u64);
@@ -755,13 +740,13 @@ impl<M: GuestAddressSpace> Queue<M> {
     }
 
     /// Check whether a notification to the guest is needed.
-    pub fn needs_notification(&mut self, used_idx: Wrapping<u16>) -> bool {
+    pub fn needs_notification<M: GuestMemory>(&mut self, mem: &M, used_idx: Wrapping<u16>) -> bool {
         let mut notify = true;
 
         // The VRING_AVAIL_F_NO_INTERRUPT flag isn't supported yet.
         if self.event_idx_enabled {
             if let Some(old_idx) = self.signalled_used.replace(used_idx) {
-                if let Some(used_event) = self.get_used_event() {
+                if let Some(used_event) = self.get_used_event(mem) {
                     if (used_idx - used_event - Wrapping(1u16)) >= (used_idx - old_idx) {
                         notify = false;
                     }
@@ -1038,8 +1023,8 @@ pub(crate) mod tests {
         }
 
         // Creates a new Queue, using the underlying memory regions represented by the VirtQueue.
-        pub fn create_queue(&self, mem: &'a GuestMemoryMmap) -> Queue<&'a GuestMemoryMmap> {
-            let mut q = Queue::new(mem, self.size());
+        pub fn create_queue(&self) -> Queue {
+            let mut q = Queue::new(self.size());
 
             q.size = self.size();
             q.ready = true;
@@ -1075,10 +1060,10 @@ pub(crate) mod tests {
         assert!(vq.end().0 < 0x1000);
 
         // index >= queue_size
-        assert!(DescriptorChain::<&GuestMemoryMmap>::checked_new(m, vq.start(), 16, 16).is_none());
+        assert!(DescriptorChain::<GuestMemoryMmap>::checked_new(m, vq.start(), 16, 16).is_none());
 
         // desc_table address is way off
-        assert!(DescriptorChain::<&GuestMemoryMmap>::checked_new(
+        assert!(DescriptorChain::<GuestMemoryMmap>::checked_new(
             m,
             GuestAddress(0x00ff_ffff_ffff),
             16,
@@ -1088,7 +1073,7 @@ pub(crate) mod tests {
 
         // the addr field of the descriptor is way off
         vq.dtable(0).addr().store(0x0fff_ffff_ffff);
-        assert!(DescriptorChain::<&GuestMemoryMmap>::checked_new(m, vq.start(), 16, 0).is_none());
+        assert!(DescriptorChain::<GuestMemoryMmap>::checked_new(m, vq.start(), 16, 0).is_none());
 
         // let's create some invalid chains
 
@@ -1098,7 +1083,7 @@ pub(crate) mod tests {
             // ...but the length is too large
             vq.dtable(0).len().store(0xffff_ffff);
             assert!(
-                DescriptorChain::<&GuestMemoryMmap>::checked_new(m, vq.start(), 16, 0).is_none()
+                DescriptorChain::<GuestMemoryMmap>::checked_new(m, vq.start(), 16, 0).is_none()
             );
         }
 
@@ -1110,7 +1095,7 @@ pub(crate) mod tests {
             vq.dtable(0).next().store(16);
 
             assert!(
-                DescriptorChain::<&GuestMemoryMmap>::checked_new(m, vq.start(), 16, 0).is_none()
+                DescriptorChain::<GuestMemoryMmap>::checked_new(m, vq.start(), 16, 0).is_none()
             );
         }
 
@@ -1121,7 +1106,7 @@ pub(crate) mod tests {
             vq.dtable(1).set(0x2000, 0x1000, 0, 0);
 
             let mut c =
-                DescriptorChain::<&GuestMemoryMmap>::checked_new(m, vq.start(), 16, 0).unwrap();
+                DescriptorChain::<GuestMemoryMmap>::checked_new(m, vq.start(), 16, 0).unwrap();
 
             assert_eq!(
                 c.memory() as *const GuestMemoryMmap,
@@ -1151,7 +1136,7 @@ pub(crate) mod tests {
 
         // The whole descriptor table crosses guest memory boundary, it should ok.
         assert!(
-            DescriptorChain::<&GuestMemoryMmap>::checked_new(m, GuestAddress(0), 512, 1).is_some()
+            DescriptorChain::<GuestMemoryMmap>::checked_new(m, GuestAddress(0), 512, 1).is_some()
         );
     }
 
@@ -1168,7 +1153,7 @@ pub(crate) mod tests {
         let desc = vq.dtable(2);
         desc.set(0x3000, 0x1000, 0, 0);
 
-        let mut c: DescriptorChain<&GuestMemoryMmap> =
+        let mut c: DescriptorChain<GuestMemoryMmap> =
             DescriptorChain::checked_new(m, vq.start(), 16, 0).unwrap();
         assert!(c.is_indirect());
 
@@ -1234,7 +1219,7 @@ pub(crate) mod tests {
             let desc = vq.dtable(0);
             desc.set(0x1001, 0x1000, VIRTQ_DESC_F_INDIRECT, 0);
 
-            let c: DescriptorChain<&GuestMemoryMmap> =
+            let c: DescriptorChain<GuestMemoryMmap> =
                 DescriptorChain::checked_new(m, vq.start(), 16, 0).unwrap();
             assert!(c.is_indirect());
 
@@ -1249,7 +1234,7 @@ pub(crate) mod tests {
             let desc = vq.dtable(0);
             desc.set(0x1000, 0x1001, VIRTQ_DESC_F_INDIRECT, 0);
 
-            let c: DescriptorChain<&GuestMemoryMmap> =
+            let c: DescriptorChain<GuestMemoryMmap> =
                 DescriptorChain::checked_new(m, vq.start(), 16, 0).unwrap();
             assert!(c.is_indirect());
 
@@ -1262,55 +1247,55 @@ pub(crate) mod tests {
         let m = &GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let vq = VirtQueue::new(GuestAddress(0), m, 16);
 
-        let mut q = vq.create_queue(m);
+        let mut q = vq.create_queue();
 
         // q is currently valid
-        assert!(q.is_valid());
+        assert!(q.is_valid(m));
 
         // shouldn't be valid when not marked as ready
         q.ready = false;
-        assert!(!q.is_valid());
+        assert!(!q.is_valid(m));
         q.ready = true;
 
         // or when size > max_size
         q.size = q.max_size << 1;
-        assert!(!q.is_valid());
+        assert!(!q.is_valid(m));
         q.size = q.max_size;
 
         // or when size is 0
         q.size = 0;
-        assert!(!q.is_valid());
+        assert!(!q.is_valid(m));
         q.size = q.max_size;
 
         // or when size is not a power of 2
         q.size = 11;
-        assert!(!q.is_valid());
+        assert!(!q.is_valid(m));
         q.size = q.max_size;
 
         // or if the various addresses are off
 
         q.desc_table = GuestAddress(0xffff_ffff);
-        assert!(!q.is_valid());
+        assert!(!q.is_valid(m));
         q.desc_table = GuestAddress(0x1001);
-        assert!(!q.is_valid());
+        assert!(!q.is_valid(m));
         q.desc_table = vq.dtable_start();
 
         q.avail_ring = GuestAddress(0xffff_ffff);
-        assert!(!q.is_valid());
+        assert!(!q.is_valid(m));
         q.avail_ring = GuestAddress(0x1001);
-        assert!(!q.is_valid());
+        assert!(!q.is_valid(m));
         q.avail_ring = vq.avail_start();
 
         q.used_ring = GuestAddress(0xffff_ffff);
-        assert!(!q.is_valid());
+        assert!(!q.is_valid(m));
         q.used_ring = GuestAddress(0x1001);
-        assert!(!q.is_valid());
+        assert!(!q.is_valid(m));
         q.used_ring = vq.used_start();
 
         {
             // an invalid queue should return an iterator with no next
             q.ready = false;
-            let mut i = q.iter();
+            let mut i = q.iter(m);
             assert!(i.next().is_none());
         }
 
@@ -1335,7 +1320,7 @@ pub(crate) mod tests {
             vq.avail.ring(1).store(2);
             vq.avail.idx().store(2);
 
-            let mut i = q.iter();
+            let mut i = q.iter(m);
 
             {
                 let mut c = i.next().unwrap();
@@ -1370,9 +1355,9 @@ pub(crate) mod tests {
 
         // also test go_to_previous_position() works as expected
         {
-            assert!(q.iter().next().is_none());
+            assert!(q.iter(m).next().is_none());
             q.go_to_previous_position();
-            let mut c = q.iter().next().unwrap();
+            let mut c = q.iter(m).next().unwrap();
             c.next().unwrap();
             c.next().unwrap();
             c.next().unwrap();
@@ -1386,10 +1371,10 @@ pub(crate) mod tests {
         let m = &GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let vq = VirtQueue::new(GuestAddress(0), m, 16);
 
-        let mut q = vq.create_queue(m);
+        let mut q = vq.create_queue();
 
         // q is currently valid
-        assert!(q.is_valid());
+        assert!(q.is_valid(m));
 
         for j in 0..7 {
             vq.dtable(j).set(
@@ -1415,7 +1400,7 @@ pub(crate) mod tests {
         vq.avail.ring(2).store(5);
         vq.avail.idx().store(3);
 
-        let mut i = q.iter();
+        let mut i = q.iter(m);
 
         {
             let c = i.next().unwrap();
@@ -1455,15 +1440,15 @@ pub(crate) mod tests {
         let m = &GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let vq = VirtQueue::new(GuestAddress(0), m, 16);
 
-        let mut q = vq.create_queue(m);
+        let mut q = vq.create_queue();
         assert_eq!(vq.used.idx().load(), 0);
 
         //index too large
-        assert!(q.add_used(16, 0x1000).is_none());
+        assert!(q.add_used(m, 16, 0x1000).is_none());
         assert_eq!(vq.used.idx().load(), 0);
 
         //should be ok
-        assert_eq!(q.add_used(1, 0x1000).unwrap(), 1);
+        assert_eq!(q.add_used(m, 1, 0x1000).unwrap(), 1);
         assert_eq!(vq.used.idx().load(), 1);
         let x = vq.used.ring(0).load();
         assert_eq!(x.id, 1);
@@ -1475,7 +1460,7 @@ pub(crate) mod tests {
         let m = &GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let vq = VirtQueue::new(GuestAddress(0), m, 16);
 
-        let mut q = vq.create_queue(m);
+        let mut q = vq.create_queue();
         q.size = 8;
         q.ready = true;
         q.reset();
@@ -1487,54 +1472,54 @@ pub(crate) mod tests {
     fn test_needs_notification() {
         let m = &GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let vq = VirtQueue::new(GuestAddress(0), m, 16);
-        let mut q = vq.create_queue(&m);
+        let mut q = vq.create_queue();
         let avail_addr = vq.avail_start();
 
         // It should always return true when EVENT_IDX isn't enabled.
-        assert_eq!(q.needs_notification(Wrapping(1)), true);
-        assert_eq!(q.needs_notification(Wrapping(2)), true);
-        assert_eq!(q.needs_notification(Wrapping(3)), true);
-        assert_eq!(q.needs_notification(Wrapping(4)), true);
-        assert_eq!(q.needs_notification(Wrapping(5)), true);
+        assert_eq!(q.needs_notification(m, Wrapping(1)), true);
+        assert_eq!(q.needs_notification(m, Wrapping(2)), true);
+        assert_eq!(q.needs_notification(m, Wrapping(3)), true);
+        assert_eq!(q.needs_notification(m, Wrapping(4)), true);
+        assert_eq!(q.needs_notification(m, Wrapping(5)), true);
 
         vq_store_u16(m, 4, avail_addr.unchecked_add(4 + 16 * 2)).expect("write 4 to avail_addr");
         q.set_event_idx(true);
-        assert_eq!(q.needs_notification(Wrapping(1)), true);
-        assert_eq!(q.needs_notification(Wrapping(2)), false);
-        assert_eq!(q.needs_notification(Wrapping(3)), false);
-        assert_eq!(q.needs_notification(Wrapping(4)), false);
-        assert_eq!(q.needs_notification(Wrapping(5)), true);
-        assert_eq!(q.needs_notification(Wrapping(6)), false);
-        assert_eq!(q.needs_notification(Wrapping(7)), false);
+        assert_eq!(q.needs_notification(m, Wrapping(1)), true);
+        assert_eq!(q.needs_notification(m, Wrapping(2)), false);
+        assert_eq!(q.needs_notification(m, Wrapping(3)), false);
+        assert_eq!(q.needs_notification(m, Wrapping(4)), false);
+        assert_eq!(q.needs_notification(m, Wrapping(5)), true);
+        assert_eq!(q.needs_notification(m, Wrapping(6)), false);
+        assert_eq!(q.needs_notification(m, Wrapping(7)), false);
 
         vq_store_u16(m, 8, avail_addr.unchecked_add(4 + 16 * 2)).expect("write 8 to avail_addr");
-        assert_eq!(q.needs_notification(Wrapping(11)), true);
-        assert_eq!(q.needs_notification(Wrapping(12)), false);
+        assert_eq!(q.needs_notification(m, Wrapping(11)), true);
+        assert_eq!(q.needs_notification(m, Wrapping(12)), false);
 
         vq_store_u16(m, 15, avail_addr.unchecked_add(4 + 16 * 2)).expect("write 15 to avail_addr");
-        assert_eq!(q.needs_notification(Wrapping(0)), true);
-        assert_eq!(q.needs_notification(Wrapping(14)), false);
+        assert_eq!(q.needs_notification(m, Wrapping(0)), true);
+        assert_eq!(q.needs_notification(m, Wrapping(14)), false);
     }
 
     #[test]
     fn test_enable_disable_notification() {
-        let m = &GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
-        let vq = VirtQueue::new(GuestAddress(0), m, 16);
-        let mut q = vq.create_queue(&m);
+        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = VirtQueue::new(GuestAddress(0), &m, 16);
+        let mut q = vq.create_queue();
         let used_addr = vq.used_start();
 
         assert_eq!(q.event_notification_enabled, true);
         assert_eq!(q.event_idx_enabled, false);
 
-        q.enable_notification();
+        q.enable_notification(&m);
         let v = m.read_obj::<u16>(used_addr).unwrap();
         assert_eq!(v, 0);
 
-        q.disable_notification();
+        q.disable_notification(&m);
         let v = m.read_obj::<u16>(used_addr).unwrap();
         assert_eq!(v, VIRTQ_USED_F_NO_NOTIFY);
 
-        q.enable_notification();
+        q.enable_notification(&m);
         let v = m.read_obj::<u16>(used_addr).unwrap();
         assert_eq!(v, 0);
 
@@ -1542,20 +1527,20 @@ pub(crate) mod tests {
         let avail_addr = vq.avail_start();
         m.write_obj::<u16>(2, avail_addr.unchecked_add(2)).unwrap();
 
-        q.enable_notification();
+        q.enable_notification(&m);
         let v = m
             .read_obj::<u16>(used_addr.unchecked_add(4 + 8 * 16))
             .unwrap();
         assert_eq!(v, 2);
 
-        q.disable_notification();
+        q.disable_notification(&m);
         let v = m
             .read_obj::<u16>(used_addr.unchecked_add(4 + 8 * 16))
             .unwrap();
         assert_eq!(v, 2);
 
         m.write_obj::<u16>(8, avail_addr.unchecked_add(2)).unwrap();
-        q.enable_notification();
+        q.enable_notification(&m);
         let v = m
             .read_obj::<u16>(used_addr.unchecked_add(4 + 8 * 16))
             .unwrap();
