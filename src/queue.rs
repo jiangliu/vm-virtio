@@ -182,7 +182,7 @@ impl<'a, M: GuestMemory> DescriptorChain<'a, M> {
     }
 
     /// Create a new DescriptorChain instance.
-    fn checked_new(
+    pub fn checked_new(
         mem: &'a M,
         dtable_addr: GuestAddress,
         queue_size: u16,
@@ -351,6 +351,22 @@ impl<'a, M: GuestMemory> Iterator for DescriptorChain<'a, M> {
             self.has_next = curr.has_next();
 
             Some(curr)
+        }
+    }
+}
+
+impl<'a, M: GuestMemory> Clone for DescriptorChain<'a, M> {
+    fn clone(&self) -> Self {
+        DescriptorChain {
+            mem: self.mem,
+            desc_table: self.desc_table,
+            queue_size: self.queue_size,
+            ttl: self.ttl,
+            index: self.index,
+            desc: self.desc,
+            curr_indirect: self.curr_indirect.clone(),
+            is_master: self.is_master,
+            has_next: self.has_next,
         }
     }
 }
@@ -1196,6 +1212,7 @@ pub(crate) mod tests {
                 assert_eq!(desc.flags(), VIRTQ_DESC_F_NEXT);
                 assert_eq!(desc.next, j + 1);
                 assert!(c.has_next());
+                assert_eq!(c.index(), 0);
             }
         }
 
