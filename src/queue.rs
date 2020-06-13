@@ -81,6 +81,7 @@ impl std::error::Error for Error {}
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
 pub struct Descriptor {
+    /// Guest physical address of device specific data
     addr: u64,
 
     /// Length of device specific data
@@ -128,7 +129,8 @@ pub struct DescriptorChain<M: GuestAddressSpace> {
     mem: M::T,
     desc_table: GuestAddress,
     queue_size: u16,
-    ttl: u16, // used to prevent infinite chain cycles
+    ttl: u16,   // used to prevent infinite chain cycles
+    index: u16, // descriptor index of the chain header
 
     /// The current descriptor
     desc: Descriptor,
@@ -161,6 +163,7 @@ impl<M: GuestAddressSpace> DescriptorChain<M> {
             desc_table,
             queue_size,
             ttl,
+            index,
             desc,
             curr_indirect: None,
             is_master: true,
@@ -212,6 +215,7 @@ impl<M: GuestAddressSpace> DescriptorChain<M> {
             desc_table: GuestAddress(desc_head),
             queue_size: (desc_len / VIRTQ_DESCRIPTOR_SIZE) as u16,
             ttl: (desc_len / VIRTQ_DESCRIPTOR_SIZE) as u16,
+            index: self.index,
             desc: Descriptor {
                 addr: desc.addr,
                 len: desc.len,
@@ -234,6 +238,11 @@ impl<M: GuestAddressSpace> DescriptorChain<M> {
             .checked_offset(self.desc.addr(), self.desc.len as usize)
             .filter(|_| !self.has_next() || self.desc.next < self.queue_size)
             .is_some()
+    }
+
+    /// Get the descriptor index of the chain header
+    pub fn index(&self) -> u16 {
+        self.index
     }
 
     /// Checks if this descriptor chain has another descriptor chain linked after it.
@@ -1134,6 +1143,7 @@ pub(crate) mod tests {
         let desc2 = VirtqDesc::new(&dtable2, 0);
         desc2.set(0x8000, 0x1000, 0, 0);
 
+        assert_eq!(c.index(), 0);
         // try to iterate through the first indirect descriptor chain
         for j in 0..4 {
             let desc = c.next().unwrap();
@@ -1270,19 +1280,25 @@ pub(crate) mod tests {
 
             {
                 let mut c = i.next().unwrap();
+                assert_eq!(c.index(), 0);
+
                 c.next().unwrap();
                 assert!(!c.has_next());
                 assert!(c.next().is_some());
                 assert!(c.next().is_none());
+                assert_eq!(c.index(), 0);
             }
 
             {
                 let mut c = i.next().unwrap();
+                assert_eq!(c.index(), 2);
+
                 c.next().unwrap();
                 c.next().unwrap();
                 c.next().unwrap();
                 assert!(!c.has_next());
                 assert!(c.next().is_none());
+                assert_eq!(c.index(), 2);
             }
         }
 
@@ -1337,6 +1353,8 @@ pub(crate) mod tests {
 
         {
             let c = i.next().unwrap();
+            assert_eq!(c.index(), 0);
+
             let mut iter = c.into_iter();
             assert!(iter.next().is_some());
             assert!(iter.next().is_some());
@@ -1346,6 +1364,8 @@ pub(crate) mod tests {
 
         {
             let c = i.next().unwrap();
+            assert_eq!(c.index(), 2);
+
             let mut iter = c.writable();
             assert!(iter.next().is_some());
             assert!(iter.next().is_some());
@@ -1355,6 +1375,8 @@ pub(crate) mod tests {
 
         {
             let c = i.next().unwrap();
+            assert_eq!(c.index(), 5);
+
             let mut iter = c.readable();
             assert!(iter.next().is_some());
             assert!(iter.next().is_none());
