@@ -120,6 +120,11 @@ impl Descriptor {
     pub fn is_write_only(&self) -> bool {
         self.flags & VIRTQ_DESC_F_WRITE != 0
     }
+
+    /// Checks if this descriptor has another descriptor linked after it.
+    pub fn has_next(&self) -> bool {
+        self.flags & VIRTQ_DESC_F_NEXT != 0
+    }
 }
 
 unsafe impl ByteValued for Descriptor {}
@@ -136,6 +141,7 @@ pub struct DescriptorChain<M: GuestAddressSpace> {
     desc: Descriptor,
     curr_indirect: Option<Box<DescriptorChain<M>>>,
     is_master: bool,
+    has_next: bool,
 }
 
 impl<M: GuestAddressSpace> DescriptorChain<M> {
@@ -167,6 +173,7 @@ impl<M: GuestAddressSpace> DescriptorChain<M> {
             desc,
             curr_indirect: None,
             is_master: true,
+            has_next: true,
         };
 
         if chain.is_valid() {
@@ -224,6 +231,7 @@ impl<M: GuestAddressSpace> DescriptorChain<M> {
             },
             curr_indirect: None,
             is_master: false,
+            has_next: true,
         };
 
         if !chain.is_valid() {
@@ -236,7 +244,7 @@ impl<M: GuestAddressSpace> DescriptorChain<M> {
     fn is_valid(&self) -> bool {
         self.mem
             .checked_offset(self.desc.addr(), self.desc.len as usize)
-            .filter(|_| !self.has_next() || self.desc.next < self.queue_size)
+            .filter(|_| !self.desc.has_next() || self.desc.next < self.queue_size)
             .is_some()
     }
 
@@ -247,7 +255,7 @@ impl<M: GuestAddressSpace> DescriptorChain<M> {
 
     /// Checks if this descriptor chain has another descriptor chain linked after it.
     pub fn has_next(&self) -> bool {
-        self.desc.flags & VIRTQ_DESC_F_NEXT != 0 && self.ttl > 1
+        self.has_next || self.curr_indirect.is_some()
     }
 
     /// Checks if the descriptor is an indirect descriptor.
@@ -329,7 +337,7 @@ impl<M: GuestAddressSpace> Iterator for DescriptorChain<M> {
             }
         } else {
             let curr = self.desc;
-            if !self.has_next() {
+            if !curr.has_next() {
                 self.ttl = 0
             } else {
                 let index = self.desc.next;
@@ -341,6 +349,8 @@ impl<M: GuestAddressSpace> Iterator for DescriptorChain<M> {
                     .load(index as usize);
                 self.ttl -= 1;
             }
+
+            self.has_next = curr.has_next();
 
             Some(curr)
         }
@@ -1137,6 +1147,7 @@ pub(crate) mod tests {
             indirect_table.push(desc);
         }
 
+        // create an indirect table with 1 chained descriptor
         let dtable2 = region
             .get_slice(MemoryRegionAddress(0x2000u64), VirtqDesc::dtable_len(1))
             .unwrap();
@@ -1144,25 +1155,32 @@ pub(crate) mod tests {
         desc2.set(0x8000, 0x1000, 0, 0);
 
         assert_eq!(c.index(), 0);
+        assert!(c.has_next());
         // try to iterate through the first indirect descriptor chain
         for j in 0..4 {
             let desc = c.next().unwrap();
             if j < 3 {
                 assert_eq!(desc.flags(), VIRTQ_DESC_F_NEXT);
                 assert_eq!(desc.next, j + 1);
+                assert!(c.has_next());
             }
         }
 
         // try to iterate through the second indirect descriptor chain
+        assert!(c.has_next());
         let desc = c.next().unwrap();
         assert_eq!(desc.addr(), GuestAddress(0x8000));
 
         // back to the main descriptor chain
+        assert!(c.has_next());
         let desc = c.next().unwrap();
         assert_eq!(desc.addr(), GuestAddress(0x3000));
 
+        assert!(!c.has_next());
         assert!(c.next().is_none());
+        assert!(!c.has_next());
         assert!(c.next().is_none());
+        assert!(!c.has_next());
     }
 
     #[test]
@@ -1282,10 +1300,13 @@ pub(crate) mod tests {
                 let mut c = i.next().unwrap();
                 assert_eq!(c.index(), 0);
 
+                assert!(c.has_next());
                 c.next().unwrap();
-                assert!(!c.has_next());
+                assert!(c.has_next());
                 assert!(c.next().is_some());
+                assert!(!c.has_next());
                 assert!(c.next().is_none());
+                assert!(!c.has_next());
                 assert_eq!(c.index(), 0);
             }
 
@@ -1293,11 +1314,15 @@ pub(crate) mod tests {
                 let mut c = i.next().unwrap();
                 assert_eq!(c.index(), 2);
 
+                assert!(c.has_next());
                 c.next().unwrap();
+                assert!(c.has_next());
                 c.next().unwrap();
+                assert!(c.has_next());
                 c.next().unwrap();
                 assert!(!c.has_next());
                 assert!(c.next().is_none());
+                assert!(!c.has_next());
                 assert_eq!(c.index(), 2);
             }
         }
