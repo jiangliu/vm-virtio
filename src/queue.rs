@@ -14,11 +14,11 @@ use std::cmp::min;
 use std::fmt::{self, Display};
 use std::mem::size_of;
 use std::num::Wrapping;
-use std::sync::atomic::{fence, AtomicU16, Ordering};
+use std::ops::Deref;
+use std::sync::atomic::{fence, AtomicU16, AtomicU32, Ordering};
 
 use vm_memory::{
-    Address, ByteValued, Bytes, GuestAddress, GuestAddressSpace, GuestMemory, GuestUsize,
-    VolatileMemory,
+    Address, ByteValued, GuestAddress, GuestAddressSpace, GuestMemory, GuestUsize, VolatileMemory,
 };
 
 pub(super) const VIRTQ_DESC_F_NEXT: u16 = 0x1;
@@ -43,13 +43,14 @@ const VIRTQ_AVAIL_RING_HEADER_SIZE: usize = 4;
 // VIRTQ_AVAIL_RING_META_SIZE + VIRTQ_AVAIL_ELEMENT_SIZE * queue_size
 const VIRTQ_AVAIL_RING_META_SIZE: usize = VIRTQ_AVAIL_RING_HEADER_SIZE + 2;
 
-// GuestMemory::read_obj() will be used to fetch the descriptor,
-// which has an explicit constraint that the entire descriptor doesn't
-// cross the page boundary. Otherwise the descriptor may be split into
-// two mmap regions which causes failure of GuestMemory::read_obj().
+// AtomicU16::load() will be used to fetch the descriptor, and AtomicU16 is
+// returned by VolatileSlice::get_atomic_ref(), which has an explicit constraint
+// that the entire descriptor doesn't cross the page boundary. Otherwise the
+// descriptor may be split into two mmap regions which causes failure of
+// VolatileSlice::get_atomic_ref().
 //
 // The Virtio Spec 1.0 defines the alignment of VirtIO descriptor is 16 bytes,
-// which fulfills the explicit constraint of GuestMemory::read_obj().
+// which fulfills the explicit constraint of VolatileSlice::get_atomic_ref().
 const VIRTQ_DESCRIPTOR_SIZE: usize = 16;
 
 /// Virtio Queue related errors.
@@ -424,11 +425,17 @@ impl<'b, M: GuestAddressSpace> Iterator for AvailIter<'b, M> {
             as usize;
         let avail_addr = self.avail_ring.checked_add(offset as u64)?;
         // This index is checked below in checked_new
-        let desc_index: u16 = self
-            .mem
-            .read_obj(avail_addr)
-            .map_err(|_e| error!("Failed to read from memory {:x}", avail_addr.raw_value()))
-            .ok()?;
+        let desc_index: u16 = match vq_load_u16(self.mem.deref(), avail_addr) {
+            Ok(index) => index,
+            Err(e) => {
+                error!(
+                    "Failed to read desc_index from avail_addr ({:?}): {:?}",
+                    avail_addr.raw_value(),
+                    e
+                );
+                return None;
+            }
+        };
 
         self.next_index += Wrapping(1);
 
@@ -599,8 +606,8 @@ impl<M: GuestAddressSpace> Queue<M> {
             }
         };
         // Note that last_index has no invalid values
-        let last_index: u16 = match mem.read_obj::<u16>(index_addr) {
-            Ok(ret) => ret,
+        let last_index: u16 = match vq_load_u16(mem.deref(), index_addr) {
+            Ok(index) => index,
             Err(_) => return AvailIter::new(mem, &mut self.next_avail),
         };
 
@@ -631,9 +638,10 @@ impl<M: GuestAddressSpace> Queue<M> {
         let used_elem = used_ring.unchecked_add(4 + next_used * 8);
 
         // These writes can't fail as we are guaranteed to be within the descriptor ring.
-        mem.write_obj(u32::from(desc_index), used_elem).unwrap();
-        mem.write_obj(len as u32, used_elem.unchecked_add(4))
-            .unwrap();
+        vq_store_u32(mem.deref(), u32::from(desc_index), used_elem)
+            .expect("update used_elem desc_index");
+        vq_store_u32(mem.deref(), len as u32, used_elem.unchecked_add(4))
+            .expect("update used_elem len");
 
         self.next_used += Wrapping(1);
 
@@ -641,8 +649,8 @@ impl<M: GuestAddressSpace> Queue<M> {
         fence(Ordering::Release);
 
         // We are guaranteed to be within the used ring, this write can't fail.
-        mem.write_obj(self.next_used.0, used_ring.unchecked_add(2))
-            .unwrap();
+        vq_store_u16(mem.deref(), self.next_used.0, used_ring.unchecked_add(2))
+            .expect("update used_ring next_used");
 
         Some(self.next_used.0)
     }
@@ -663,21 +671,12 @@ impl<M: GuestAddressSpace> Queue<M> {
         // boundary and get_slice() shouldn't fail.
         let mem = self.mem.memory();
         let index_addr = self.avail_ring.unchecked_add(2);
-        match mem.get_slice(index_addr, size_of::<u16>()).map(|s| {
-            s.get_atomic_ref::<AtomicU16>(0)
-                .unwrap()
-                .load(Ordering::Relaxed)
-        }) {
+        match vq_load_u16(mem.deref(), index_addr) {
             Ok(index) => {
                 let offset = (4 + self.actual_size() * 8) as u64;
                 let avail_event_addr = self.used_ring.unchecked_add(offset);
-                if let Ok(avail_event_slice) = mem.get_slice(avail_event_addr, size_of::<u16>()) {
-                    avail_event_slice
-                        .get_atomic_ref::<AtomicU16>(0)
-                        .unwrap()
-                        .store(index, Ordering::Relaxed);
-                } else {
-                    warn!("Can't update avail_event");
+                if let Err(e) = vq_store_u16(mem.deref(), index, avail_event_addr) {
+                    warn!("Can't update avail_event: {:?}", e);
                 }
             }
             Err(e) => warn!("Invalid offset, {}", e),
@@ -747,16 +746,12 @@ impl<M: GuestAddressSpace> Queue<M> {
         let used_event_addr = self
             .avail_ring
             .unchecked_add((4 + self.actual_size() * 2) as u64);
+        let used_event: Option<Wrapping<u16>> = match vq_load_u16(mem.deref(), used_event_addr) {
+            Ok(u) => Some(Wrapping(u)),
+            Err(_) => None,
+        };
 
-        mem.get_slice(used_event_addr, size_of::<u16>())
-            .map(|s| {
-                Wrapping(
-                    s.get_atomic_ref::<AtomicU16>(0)
-                        .unwrap()
-                        .load(Ordering::Relaxed),
-                )
-            })
-            .ok()
+        used_event
     }
 
     /// Check whether a notification to the guest is needed.
@@ -785,6 +780,52 @@ impl<M: GuestAddressSpace> Queue<M> {
     }
 }
 
+fn vq_load_u16<M: GuestMemory>(mem: &M, addr: GuestAddress) -> Result<u16, Error> {
+    let ret: u16 = match mem.get_slice(addr, size_of::<u16>()) {
+        Ok(addr_slice) => addr_slice
+            .get_atomic_ref::<AtomicU16>(0)
+            .unwrap()
+            .load(Ordering::Relaxed),
+        Err(e) => {
+            error!("Can't load guest addr (0x{:08x}): {:?}", addr.0, e);
+            return Err(Error::GuestMemoryError);
+        }
+    };
+    Ok(ret)
+}
+
+fn vq_store_u32<M: GuestMemory>(mem: &M, value: u32, addr: GuestAddress) -> Result<(), Error> {
+    match mem.get_slice(addr, size_of::<u32>()) {
+        Ok(addr_slice) => {
+            addr_slice
+                .get_atomic_ref::<AtomicU32>(0)
+                .unwrap()
+                .store(value, Ordering::Relaxed);
+            return Ok(());
+        }
+        Err(e) => {
+            error!("Can't store guest addr (0x{:08x}): {:?}", addr.0, e);
+            return Err(Error::GuestMemoryError);
+        }
+    }
+}
+
+fn vq_store_u16<M: GuestMemory>(mem: &M, value: u16, addr: GuestAddress) -> Result<(), Error> {
+    match mem.get_slice(addr, size_of::<u16>()) {
+        Ok(addr_slice) => {
+            addr_slice
+                .get_atomic_ref::<AtomicU16>(0)
+                .unwrap()
+                .store(value, Ordering::Relaxed);
+            return Ok(());
+        }
+        Err(e) => {
+            error!("Can't store guest addr (0x{:08x}): {:?}", addr.0, e);
+            return Err(Error::GuestMemoryError);
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     extern crate vm_memory;
@@ -794,8 +835,8 @@ pub(crate) mod tests {
 
     pub use super::*;
     use vm_memory::{
-        GuestAddress, GuestMemoryMmap, GuestMemoryRegion, MemoryRegionAddress, VolatileMemory,
-        VolatileRef, VolatileSlice,
+        Bytes, GuestAddress, GuestMemoryMmap, GuestMemoryRegion, MemoryRegionAddress,
+        VolatileMemory, VolatileRef, VolatileSlice,
     };
 
     // Represents a virtio descriptor in guest memory.
@@ -1456,8 +1497,7 @@ pub(crate) mod tests {
         assert_eq!(q.needs_notification(Wrapping(4)), true);
         assert_eq!(q.needs_notification(Wrapping(5)), true);
 
-        m.write_obj::<u16>(4, avail_addr.unchecked_add(4 + 16 * 2))
-            .unwrap();
+        vq_store_u16(m, 4, avail_addr.unchecked_add(4 + 16 * 2)).expect("write 4 to avail_addr");
         q.set_event_idx(true);
         assert_eq!(q.needs_notification(Wrapping(1)), true);
         assert_eq!(q.needs_notification(Wrapping(2)), false);
@@ -1467,13 +1507,11 @@ pub(crate) mod tests {
         assert_eq!(q.needs_notification(Wrapping(6)), false);
         assert_eq!(q.needs_notification(Wrapping(7)), false);
 
-        m.write_obj::<u16>(8, avail_addr.unchecked_add(4 + 16 * 2))
-            .unwrap();
+        vq_store_u16(m, 8, avail_addr.unchecked_add(4 + 16 * 2)).expect("write 8 to avail_addr");
         assert_eq!(q.needs_notification(Wrapping(11)), true);
         assert_eq!(q.needs_notification(Wrapping(12)), false);
 
-        m.write_obj::<u16>(15, avail_addr.unchecked_add(4 + 16 * 2))
-            .unwrap();
+        vq_store_u16(m, 15, avail_addr.unchecked_add(4 + 16 * 2)).expect("write 15 to avail_addr");
         assert_eq!(q.needs_notification(Wrapping(0)), true);
         assert_eq!(q.needs_notification(Wrapping(14)), false);
     }
